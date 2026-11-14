@@ -36,12 +36,36 @@ dsh plugin --profile desktop add C:\Sophia\dev-plugin\dsh-subproxy
 只在你本地跑测试时存在（用 junction 指向宿主解析出来的包），不会进 git、也不进 `files`。
 所以手机上不需要 agy 二进制、不需要 gcc、不需要 pnpm 之外的任何东西。
 
-## 登录：`/subproxy` 命令
+## 登录：设置 → 订阅反代
 
-登录入口是**斜杠命令**，不是设置页按钮 —— 这不是偷懒。宿主的 Web 与手机前端
-在整张 RPC 表里只有 `authorization/settled` 一个事件，没有任何 `authorization/*`
-调用端点，所以 `ctx.authorization.registerFlow()` 注册的登录流在 Web/手机上**没有
-任何渲染面**（只有 Electron 的桌面 UI 会用）。命令是所有前端都会渲染的那一个面。
+装完重启宿主，打开 **设置 → 订阅反代**，里面是三条路由各一张卡片：未登录 / 待授权 /
+已登录，一行一个按钮。手机上同样点得到 —— 这一页走的是宿主自己的 Web 界面，
+不依赖 Electron。
+
+- **未登录** → 「登录」。浏览器授权链接直接渲染成可点的 `<a>`，点开授权即可。
+- **OpenAI 那条** 另外有「设备码登录」：卡片上给出 `auth.openai.com/codex/device`
+  和一串代码，在任意设备（这台、另一台、手机）输进去就行，**全程不用粘贴任何东西**，
+  插件轮询到即自动完成。这是手机上最省事的一条路。
+- **待授权** → 卡片显示链接／代码，底部一个「提交」框用来粘回跳转地址，还有「取消这次登录」。
+- **已登录** → 显示账号（`email:…`）、套餐（如 `Google AI Ultra`）、可用模型数，
+  以及「另有 N 个需升级套餐」。
+
+页面只在有登录在等输入时每 2.5 秒轮询一次；空闲时一个请求都不发。
+
+宿主侧是插件自己注册的一个端点 `GET/POST /plugins/dsh-subproxy`（`webServer.register`，
+`kind: 'exact'`），所有动作都委托给同一个 `runCommand()` —— 命令与按钮走同一套逻辑，
+不会漂成两份。浏览器 bundle 由宿主的 combo 路由提供（`plugins/??dsh-subproxy/client.js&rev=…`），
+没有构建步骤，`lib/client.js` 就是最终产物。
+
+### 为什么不用 `ctx.authorization.registerFlow()`
+
+宿主的 Web 与手机前端在整张 RPC 表里只有 `authorization/settled` 一个事件，没有任何
+`authorization/*` 调用端点，所以 `registerFlow()` 注册的登录流在 Web/手机上**没有任何
+渲染面**（只有 Electron 的桌面 UI 会用）。设置页这一节是自己搭的渲染面。
+
+## 登录：`/subproxy` 命令（同一条路的文字版）
+
+命令版仍然完整可用，出问题、或不想离开输入框时用它。
 
 ```text
 /subproxy                        # 三条路由的登录状态（含 Antigravity 的模型数与套餐）
@@ -51,21 +75,21 @@ dsh plugin --profile desktop add C:\Sophia\dev-plugin\dsh-subproxy
 /subproxy logout sub-gemini
 ```
 
-**大多数情况你不需要跑这个。** 本机已有的登录态会被自动吸收（见下一节「登录拉取」）。
-只有在机器上完全没有登录过、或者你要专门换一个号时，才需要这两条命令。
+**大多数情况你不需要跑这个。** 本机已有的登录态会被自动吸收（见「登录拉取」一节）。
+只有在机器上完全没有登录过、或者你要专门换一个号时，才需要它。
 
 `login` 与 `code` 是两步，因为命令处理器只能返回一次结果，而 OAuth 要人去浏览器点。
 两步之间插件的后台协程持有那个未答复的 prompt，`code` 把答案送回去，然后按真实结局
-报成功或失败（`登录失败：invalid_grant: Malformed auth code.` 这类）。等链接时不再
-死等固定的 1.2 秒 —— 授权地址一落地就返回，慢网络下也不会打印空结果。
+报成功或失败（`登录失败：invalid_grant: Malformed auth code.` 这类，取错误首行并截断，
+不会把整个堆栈糊到手机上）。等链接时不死等固定的 1.2 秒 —— 授权地址一落地就返回。
 
 **手机端**：登录时先看清浏览器在哪台机器上。
 
 | 浏览器在哪 | 怎么收尾 |
 | --- | --- |
 | 手机自带浏览器（和引擎同一台机器） | 授权后会跳回 `http://localhost:<端口>/...`，loopback 就地接住，**自动完成，什么都不用做** |
-| 另一台设备（在 PC 上打开手机给的链接） | 跳转到的 localhost 打不开，页面空白是正常的；把地址栏那一整串复制，`/subproxy code <粘贴>` 贴回来 |
-| 想彻底不粘贴 | 只有 OpenAI 那条线支持：`/subproxy login sub-gpt device`，在任意设备打开 `auth.openai.com/codex/device` 输代码，插件轮询到即完成 |
+| 另一台设备（在 PC 上打开手机给的链接） | 跳转到的 localhost 打不开，页面空白是正常的；把地址栏那一整串复制，粘回设置页的「提交」框，或 `/subproxy code <粘贴>` |
+| 想彻底不粘贴 | 只有 OpenAI 那条线支持：设置页点「设备码登录」，或 `/subproxy login sub-gpt device` |
 
 三条线的回调端口不一样，但都不影响上面的判断：Antigravity 每次随机一个端口、
 Claude 固定 `53692`、OpenAI 固定 `1455`。给 `device` 到不支持的线上会直接报错，
@@ -168,13 +192,18 @@ Cloud Code Assist 不属于 pi-ai 的十种 `KnownApi` 协议里的任何一种�
 
 ## 测试
 
-三套离线测试，不联网、不碰宿主：
+四套离线测试，不联网、不碰宿主：
 
 ```bash
 node test/antigravity-lane.mjs   # 30 项：schema 清洗、目录解析、账号排名、id 重编号、SSE 解帧、失败阶梯
 node test/wiring.mjs             # 28 项：三条路由注册、目录、档位、登录流、命令、账号吸收、watcher、dispose
 node test/host-contract.mjs      # 16 项：过真实 PiAiAdapter，验 harness chunk 契约
+node test/client.mjs             # 26 项：设置页 bundle —— 注册、注入、渲染、三种状态、设备码、粘贴提示
 ```
+
+`client` 那一套用假 React 求值 `lib/client.js` 的完整 bundle（`new Function` 注入
+`window`/`document`/`fetch`），断言的是 DOM 树而不是源码字符串：假 React 的 hook cells
+在多次 `Card()` 调用之间保留、只重置游标，所以能真的重渲染一次再检查状态。
 
 `wiring` 那一套跑在临时目录里的假凭据库上（`DSH_CREDENTIALS_FILE` 指到
 `mkdtemp` 出来的文件），不会去看你真实登录了什么 —— 否则你在跑测试期间切一下号就能把
