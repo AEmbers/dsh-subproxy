@@ -1,0 +1,3 @@
+- insert:
+    - id: subproxy
+      name: dsh-subproxy
