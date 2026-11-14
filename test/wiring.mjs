@@ -11,15 +11,39 @@
  * @module dsh-subproxy/test/wiring
  */
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { apply, inject, name } from '../lib/index.js'
 import { ROUTES, ROUTE_CLAUDE, ROUTE_GEMINI, ROUTE_OPENAI, ROUTE_NAMES, RECORD_SCOPE } from '../lib/constants.js'
+import { preferAccount } from '../lib/antigravity/account.js'
+import { watchStore } from '../lib/store-watch.js'
+
+// `apply()` starts a watcher on the harness credential store. Point that at a
+// scratch directory so this suite never touches the real one — and so a login
+// happening on this machine cannot perturb the run.
+const scratch = mkdtempSync(join(tmpdir(), 'subproxy-wiring-'))
+process.env.DSH_CREDENTIALS_FILE = join(scratch, '.credentials.yaml')
+writeFileSync(process.env.DSH_CREDENTIALS_FILE, 'records: []\nrefs:\n')
 
 const checks = []
 const check = async (label, body) => {
   await body()
   checks.push(label)
 }
+
+/**
+ * Wait a bounded moment for a filesystem event to land.
+ *
+ * Deliberately ref'd: everything the watcher schedules is `unref`'d so a host can
+ * shut down cleanly, which means only this timer keeps the loop alive long enough
+ * for the event to arrive.
+ *
+ * @param {number} ms - the budget.
+ * @returns {Promise<void>} resolves after the budget.
+ */
+const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /**
  * A cordis-shaped context that records everything the plugin does.
@@ -294,6 +318,64 @@ await check('the plugin declares its name and injected services', async () => {
     assert.ok(record.logs.some(([level, message]) => level === 'error' && message.includes(ROUTE_OPENAI)))
   })
 }
+
+await check('adoption takes the strongest account when nothing is signed in', async () => {
+  const candidates = [
+    { name: 'ULTRA', rank: 3, tier: 'free-tier', grant: { refresh_token: 'r-ultra' } },
+    { name: 'PRO', rank: 2, tier: 'free-tier', grant: { refresh_token: 'r-pro' } },
+  ]
+  assert.equal(preferAccount(undefined, candidates), candidates[0])
+  assert.equal(preferAccount(undefined, []), undefined)
+})
+
+await check('an account signed in by hand is never taken away', async () => {
+  const candidates = [{ name: 'ULTRA', rank: 3, tier: 'free-tier', grant: { refresh_token: 'r-ultra' } }]
+  assert.equal(preferAccount({ rank: 1, explicit: true, refresh: 'r-mine' }, candidates), undefined)
+})
+
+await check('the account already in use is not re-adopted on every store write', async () => {
+  // Without this the watcher would rewrite the record on every token refresh,
+  // and each rewrite wakes the watcher again.
+  const candidates = [{ name: 'ULTRA', rank: 3, tier: 'free-tier', grant: { refresh_token: 'r-same' } }]
+  assert.equal(preferAccount({ rank: 3, refresh: 'r-same' }, candidates), undefined)
+})
+
+await check('only a strictly better plan displaces the account in use', async () => {
+  const ranked = (rank) => [{ name: `A${rank}`, rank, tier: 'free-tier', grant: { refresh_token: `r-${rank}` } }]
+  assert.equal(preferAccount({ rank: 2, refresh: 'r-mine' }, ranked(2)), undefined)
+  assert.equal(preferAccount({ rank: 2, refresh: 'r-mine' }, ranked(1)), undefined)
+  assert.equal(preferAccount({ rank: 2, refresh: 'r-mine' }, ranked(3)).rank, 3)
+  // A current account whose rank could not be read ranks as zero, so any live
+  // candidate beats it — being stuck on an unprobeable grant is worse.
+  assert.equal(preferAccount({ refresh: 'r-mine' }, ranked(1)).rank, 1)
+})
+
+await check('a write to the credential store wakes the watcher, and disposing stops it', async () => {
+  const store = join(scratch, 'watched', '.credentials.yaml')
+  mkdirSync(join(scratch, 'watched'), { recursive: true })
+  writeFileSync(store, 'refs:\n')
+  const hits = []
+  const stop = watchStore(() => hits.push(Date.now()), { path: store, debounceMs: 20 })
+  await settle(120)
+  writeFileSync(store, 'refs:\n  NEW_ACCOUNT: x\n')
+  await settle(400)
+  const woke = hits.length
+  assert.ok(woke >= 1, 'a rewritten store did not wake the watcher')
+  stop()
+  stop() // idempotent
+  writeFileSync(store, 'refs:\n  NEWER_ACCOUNT: y\n')
+  await settle(400)
+  assert.equal(hits.length, woke, 'the watcher fired after it was disposed')
+})
+
+await check('a store file whose directory does not exist yet is not fatal', async () => {
+  // A fresh install has no `~/.dsh` — mounting must still succeed, with the
+  // watch simply not armed yet.
+  const missing = join(scratch, 'not-there-yet', '.credentials.yaml')
+  const stop = watchStore(() => {}, { path: missing, debounceMs: 20 })
+  assert.equal(typeof stop, 'function')
+  stop()
+})
 
 console.log(`\n${checks.length} checks passed`)
 for (const label of checks) console.log(`  ok  ${label}`)

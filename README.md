@@ -51,6 +51,9 @@ dsh plugin --profile desktop add C:\Sophia\dev-plugin\dsh-subproxy
 /subproxy logout sub-gemini
 ```
 
+**大多数情况你不需要跑这个。** 本机已有的登录态会被自动吸收（见下一节「登录拉取」）。
+只有在机器上完全没有登录过、或者你要专门换一个号时，才需要这两条命令。
+
 `login` 与 `code` 是两步，因为命令处理器只能返回一次结果，而 OAuth 要人去浏览器点。
 两步之间插件的后台协程持有那个未答复的 prompt，`code` 把答案送回去，然后按真实结局
 报成功或失败（`登录失败：invalid_grant: Malformed auth code.` 这类）。等链接时不再
@@ -71,15 +74,43 @@ Claude 固定 `53692`、OpenAI 固定 `1455`。给 `device` 到不支持的线�
 凭据写在 `dsh-subproxy` 这个 credential scope 下，与宿主自带的 `llm-pi-ai` 完全隔离 ——
 两家插件不会互相读到对方解析不了的记录。
 
-### 不用登录也能用上本机已有的 Google 账号
+## 登录拉取：账号自动吸收
 
-Antigravity IDE / `agy` 把登录态写在 `~/.dsh/.credentials.yaml` 的 **`refs:`** 段
-（不是 `records:` 段）。宿主的 `CredentialProvider` 只枚举 `records:`，所以插件平时
-看不见它们。冷启动时插件会自己扫一遍 `refs:`，逐个拿 `loadCodeAssist` 探档位，按套餐
-从高到低排，**采纳最强那个**写进自己的 record。所以本机已经登录过 Antigravity 的话，
-装完就有模型，不用再登一次。
+这一条是不用做的。你在任何地方登录过 Google 账号，插件自己会把它收进来。
 
-已有属于本插件自己的凭据时**不会换号**——只探档位用来显示，绝不把路由悄悄切给别的账号。
+Antigravity IDE / `agy` / 各种上游工具把登录态写在 `~/.dsh/.credentials.yaml` 的
+**`refs:`** 段（扁平 `KEY: <json>`），宿主自己的 `CredentialProvider` 只枚举 `records:`
+段，所以那堆账号平时对任何插件都是隐形的。本插件做了两件事：
+
+1. **扫描**：`readStoreRefs()` 自己解析 `refs:` 段，`grantOf()` 只认 Google 形状的
+   （`scopes` 含 `googleapis.com` 或 access 以 `ya29.` 开头，且 refresh 齐全；PEM、
+   没有 refresh、JSON 坏掉的一律跳过）。逐个拿 `loadCodeAssist` 探套餐档位，
+   **按 `paidTier` 排名，不是 `currentTier`** —— Ultra 账号的 `currentTier.id` 经常就是
+   `free-tier`，只看它会把这个号判成免费号。
+2. **监视**：`watchStore()` 用 `fs.watch` 盯着凭据库所在**目录**（不是文件本身 ——
+   宿主写库是 rename 替换，盯文件会随 inode 一起失效），400ms debounce。此后你在任何
+   设备、任何客户端里登录或切换 Google 账号，最多十几秒后模型的档位就跟着变，不用重启。
+
+吸收时有四条规则，都在 `preferAccount()` 这个纯函数里：
+
+| 情况 | 行为 |
+| --- | --- |
+| 本插件还没有凭据 | 取排名最高的那个 |
+| 你现在这个号是 `/subproxy login` 亲手登的 | **永不换号**（探档位只用来显示） |
+| 扫出来的最强号和你正在用的是同一个 refresh token | 不重写（避免每次写库都白跑一轮） |
+| 有更强的套餐（严格更高，不是同档） | 换成它，重建目录并让选择器立刻刷新 |
+
+「亲手登的」怎么识别：插件吸收时是把 grant **复制**成 `records: dsh-subproxy/sub-gemini`，
+而 `/subproxy login` 走 pi-ai 写自己那条 record、**不动 `refs:`**。所以「当前 refresh token
+在 `refs:` 里找不到」就一定是人登的 —— 这个判断跨重启仍然成立，不是内存里的一个开关。
+
+Windows 上有个必须记住的坑：`fs.watch` 用 8.3 短名（`C:\Users\ADMINI~1\...`）起监视、
+却在事件里回报长名，libuv 的断言直接 `abort()` 整个进程
+（`Assertion failed: !_wcsnicmp(filename, dir, dirlen), src\win\fs-event.c`）。
+`canonicalDirectory()` 先用 `realpathSync.native` 规范化再 watch，就是为了这个。
+
+所以：本机已经登录过 Antigravity 的话，装完就有模型；手机上的引擎只要和登录态在同一个
+`~/.dsh` 里，也同样自动可用。
 
 ## 模型为什么会「少」
 
@@ -141,9 +172,14 @@ Cloud Code Assist 不属于 pi-ai 的十种 `KnownApi` 协议里的任何一种�
 
 ```bash
 node test/antigravity-lane.mjs   # 30 项：schema 清洗、目录解析、账号排名、id 重编号、SSE 解帧、失败阶梯
-node test/wiring.mjs             # 22 项：三条路由注册、目录、档位、登录流、命令、dispose
+node test/wiring.mjs             # 28 项：三条路由注册、目录、档位、登录流、命令、账号吸收、watcher、dispose
 node test/host-contract.mjs      # 16 项：过真实 PiAiAdapter，验 harness chunk 契约
 ```
+
+`wiring` 那一套跑在临时目录里的假凭据库上（`DSH_CREDENTIALS_FILE` 指到
+`mkdtemp` 出来的文件），不会去看你真实登录了什么 —— 否则你在跑测试期间切一下号就能把
+测试搞红。它覆盖了吸收的四条规则、watcher 被写库唤醒、`dispose` 之后 watcher 停下、
+以及凭据库的目录还不存在时不会炸。
 
 `antigravity-lane` 把 `fetch` 换成 fixture 路由，整条请求链路（翻译 → 序列化 → 解帧 → pi-ai 事件）
 跑的是真实代码，只是上游是假的。`host-contract` 不用 mock，直接拿宿主的 `PiAiAdapter`
