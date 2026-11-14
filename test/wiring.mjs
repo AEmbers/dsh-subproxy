@@ -253,6 +253,15 @@ await check('the plugin declares its name and injected services', async () => {
     assert.ok(out.text.includes('subproxy login'), 'the error must point at the command that starts a login')
   })
 
+  await check('a device-code login is refused for a route that has no such method', async () => {
+    const handler = record.commands[0].handler
+    for (const route of [ROUTE_GEMINI, ROUTE_CLAUDE]) {
+      const out = await handler({ agent: {}, rawInput: `login ${route} device`, attachments: [] })
+      assert.equal(out.kind, 'error', `${route} must not silently fall back to browser login`)
+      assert.ok(out.text.includes(`login ${route}`), `the error must name the command that does work for ${route}`)
+    }
+  })
+
   await check('startup reports the routes and logs no error without a grant', async () => {
     assert.deepEqual(
       record.logs.filter(([level]) => level === 'error'),

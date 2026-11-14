@@ -4,9 +4,9 @@
 
 | 路由 | 上游 | 模型数 | 登录方式 |
 | --- | --- | --- | --- |
-| `sub-gpt` | OpenAI ChatGPT Plus/Pro（Codex 线路） | 9 | OAuth |
-| `sub-claude` | Anthropic Claude Pro/Max | 17 | OAuth |
-| `sub-gemini` | Google Antigravity（Cloud Code Assist） | 随账号目录（本人 Ultra 账号：12） | OAuth |
+| `sub-gpt` | OpenAI ChatGPT Plus/Pro（Codex 线路） | 9 | OAuth（浏览器 / 设备码） |
+| `sub-claude` | Anthropic Claude Pro/Max | 17 | OAuth（浏览器） |
+| `sub-gemini` | Google Antigravity（Cloud Code Assist） | 随账号目录（本人 Ultra 账号：12） | OAuth（浏览器） |
 
 反代的意思很直白：不用 API key、不按 token 计费，用的是你已经付过钱的订阅额度。
 所以 `GET /models` 里这些模型的价格一律记 0 —— 不是漏填，是这套额度本来就不按 token 卖。
@@ -44,20 +44,29 @@ dsh plugin --profile desktop add C:\Sophia\dev-plugin\dsh-subproxy
 任何渲染面**（只有 Electron 的桌面 UI 会用）。命令是所有前端都会渲染的那一个面。
 
 ```text
-/subproxy                  # 三条路由的登录状态（含 Antigravity 的模型数与套餐）
-/subproxy login sub-gemini # 开始登录，打印授权链接
-/subproxy code <粘贴>       # 把浏览器跳转后的地址（或 code）贴回来
+/subproxy                        # 三条路由的登录状态（含 Antigravity 的模型数与套餐）
+/subproxy login sub-gemini       # 开始登录，打印授权链接
+/subproxy login sub-gpt device   # 设备码：在任意设备输一串代码，全程不用粘贴
+/subproxy code <粘贴>             # 把浏览器跳转后的地址（或 code）贴回来
 /subproxy logout sub-gemini
 ```
 
 `login` 与 `code` 是两步，因为命令处理器只能返回一次结果，而 OAuth 要人去浏览器点。
 两步之间插件的后台协程持有那个未答复的 prompt，`code` 把答案送回去，然后按真实结局
-报成功或失败（`登录失败：invalid_grant: Malformed auth code.` 这类）。
+报成功或失败（`登录失败：invalid_grant: Malformed auth code.` 这类）。等链接时不再
+死等固定的 1.2 秒 —— 授权地址一落地就返回，慢网络下也不会打印空结果。
 
-**手机端**：手机浏览器无法回调到 DSH 进程，所以三个流程都保留「粘贴」通道 ——
-浏览器授权后会跳到一个 `http://localhost:<随机端口>/oauth-callback?code=...` 的地址
-（页面打不开是正常的），把地址栏那一整串贴回来即可。插件会先尝试在本机起 loopback
-监听；起不来就用粘贴，两条路是 `Promise.race`，谁先到用谁。
+**手机端**：登录时先看清浏览器在哪台机器上。
+
+| 浏览器在哪 | 怎么收尾 |
+| --- | --- |
+| 手机自带浏览器（和引擎同一台机器） | 授权后会跳回 `http://localhost:<端口>/...`，loopback 就地接住，**自动完成，什么都不用做** |
+| 另一台设备（在 PC 上打开手机给的链接） | 跳转到的 localhost 打不开，页面空白是正常的；把地址栏那一整串复制，`/subproxy code <粘贴>` 贴回来 |
+| 想彻底不粘贴 | 只有 OpenAI 那条线支持：`/subproxy login sub-gpt device`，在任意设备打开 `auth.openai.com/codex/device` 输代码，插件轮询到即完成 |
+
+三条线的回调端口不一样，但都不影响上面的判断：Antigravity 每次随机一个端口、
+Claude 固定 `53692`、OpenAI 固定 `1455`。给 `device` 到不支持的线上会直接报错，
+不会静默退化成浏览器授权。
 
 凭据写在 `dsh-subproxy` 这个 credential scope 下，与宿主自带的 `llm-pi-ai` 完全隔离 ——
 两家插件不会互相读到对方解析不了的记录。
@@ -132,7 +141,7 @@ Cloud Code Assist 不属于 pi-ai 的十种 `KnownApi` 协议里的任何一种�
 
 ```bash
 node test/antigravity-lane.mjs   # 30 项：schema 清洗、目录解析、账号排名、id 重编号、SSE 解帧、失败阶梯
-node test/wiring.mjs             # 21 项：三条路由注册、目录、档位、登录流、命令、dispose
+node test/wiring.mjs             # 22 项：三条路由注册、目录、档位、登录流、命令、dispose
 node test/host-contract.mjs      # 16 项：过真实 PiAiAdapter，验 harness chunk 契约
 ```
 
