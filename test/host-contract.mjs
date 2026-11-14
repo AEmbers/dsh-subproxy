@@ -168,7 +168,7 @@ for (const route of ROUTES) {
   await check('prepareCall freezes a model description for the harness', async () => {
     assert.equal(prepared.model.provider, ROUTE_GEMINI)
     assert.equal(prepared.model.id, 'gemini-3.8-flash')
-    assert.equal(prepared.model.context.contextWindow, 1e6)
+    assert.equal(prepared.model.context.contextWindow, 1_048_576)
     assert.equal(typeof prepared.stream, 'function')
   })
 

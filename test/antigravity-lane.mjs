@@ -17,10 +17,12 @@ import {
   LOAD_CODE_ASSIST_PATH,
   STREAM_PATH,
   marshalAlphabetical,
+  planLabel,
   sanitizeSchema,
 } from '../lib/antigravity/protocol.js'
 import { translateRequest } from '../lib/antigravity/request.js'
-import { resolveUpstreamId } from '../lib/antigravity/catalog.js'
+import { parseAvailableModels, resolveUpstreamId } from '../lib/antigravity/catalog.js'
+import { grantOf, parseRefsBlock, rankOf } from '../lib/antigravity/account.js'
 import { streamAntigravity } from '../lib/antigravity/stream.js'
 
 const checks = []
@@ -81,6 +83,148 @@ check('upstream id: a tier the catalog does not serve falls back to its default'
   assert.equal(resolveUpstreamId('gemini-3.8-flash', 'low', entries), 'gemini-3.8-flash-low')
   assert.equal(resolveUpstreamId('gemini-3.8-flash', 'high', entries), 'gemini-3.8-flash-medium')
   assert.equal(resolveUpstreamId('gemini-3.8-pro', 'high', entries), 'gemini-3.8-pro')
+})
+
+check('catalog: tier rows fold into one entry, xhigh kept apart from high', () => {
+  const entries = parseAvailableModels({
+    models: {
+      'gemini-4-hydrogen-low': { displayName: 'Gemini 4 Hydrogen (Low)', maxTokens: 1_048_576, maxOutputTokens: 262_144 },
+      'gemini-4-hydrogen-high': { displayName: 'Gemini 4 Hydrogen (High)' },
+      'gemini-4-hydrogen-xhigh': { displayName: 'Gemini 4 Hydrogen (XHigh)' },
+    },
+  })
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].id, 'gemini-4-hydrogen')
+  assert.equal(entries[0].name, 'Gemini 4 Hydrogen')
+  assert.deepEqual(entries[0].effortOptions, ['low', 'high', 'xhigh'])
+  assert.equal(entries[0].defaultEffort, 'high')
+})
+
+check('catalog: a model with no tier rows is served under its bare id', () => {
+  const entries = parseAvailableModels({ models: { 'gemini-2.5-pro': { displayName: 'Gemini 2.5 Pro' } } })
+  assert.equal(entries[0].id, 'gemini-2.5-pro')
+  assert.equal(entries[0].effortOptions, undefined)
+  assert.equal(resolveUpstreamId('gemini-2.5-pro', 'high', entries), 'gemini-2.5-pro')
+})
+
+check('catalog: internal tab and chat rows never reach the picker', () => {
+  const entries = parseAvailableModels({
+    models: {
+      tab_flash_lite_preview: { displayName: '' },
+      chat_20706: {},
+      'gemini-2.5-flash': { displayName: 'Gemini 3.5 Flash Lite' },
+    },
+  })
+  assert.deepEqual(
+    entries.map((entry) => entry.id),
+    ['gemini-2.5-flash'],
+  )
+})
+
+check('catalog: the upstream sort order is the picker order, not the alphabet', () => {
+  const entries = parseAvailableModels({
+    models: {
+      'gpt-oss-120b-medium': { displayName: 'GPT-OSS 120B' },
+      'gemini-4-carbon-medium': { displayName: 'Gemini 4 Carbon' },
+      'claude-opus-5-5-medium': { displayName: 'Claude Opus 5.5' },
+    },
+    agentModelSorts: [
+      {
+        displayName: 'Recommended',
+        groups: [
+          { modelIds: ['gemini-4-carbon-medium', 'claude-opus-5-5-medium', 'gpt-oss-120b-medium'] },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(
+    entries.map((entry) => entry.id),
+    ['gemini-4-carbon', 'claude-opus-5-5', 'gpt-oss-120b'],
+  )
+})
+
+check('catalog: a plan-disabled family is flagged, and one live tier clears it', () => {
+  const blocked = parseAvailableModels({
+    models: {
+      'gemini-4-carbon-disabled': {
+        displayName: 'Gemini 4 Carbon',
+        disabled: true,
+        tagDescription: 'Gemini 4 Carbon is currently available to Ultra plan subscribers. More text.',
+      },
+    },
+  })
+  assert.equal(blocked[0].id, 'gemini-4-carbon')
+  assert.equal(blocked[0].disabled, true)
+  assert.equal(blocked[0].notice, 'Gemini 4 Carbon is currently available to Ultra plan subscribers')
+
+  const live = parseAvailableModels({
+    models: {
+      'gemini-4-carbon-disabled': { displayName: 'Gemini 4 Carbon', disabled: true },
+      'gemini-4-carbon-medium': { displayName: 'Gemini 4 Carbon' },
+    },
+  })
+  assert.equal(live.length, 1)
+  assert.equal(live[0].disabled, undefined)
+  assert.deepEqual(live[0].effortOptions, ['medium'])
+})
+
+check('catalog: one display name reached by several ids keeps the live row', () => {
+  const entries = parseAvailableModels({
+    models: {
+      'gemini-2.5-flash-lite': { displayName: 'Gemini 3.5 Flash Lite' },
+      'gemini-2.5-flash': { displayName: 'Gemini 3.5 Flash Lite' },
+      'gemini-3.5-flash-lite': { displayName: 'Gemini 3.5 Flash Lite' },
+    },
+    tieredModelIds: { flashLite: ['gemini-3.5-flash-lite'] },
+  })
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].id, 'gemini-3.5-flash-lite')
+})
+
+check('account: the paid plan outranks the effective tier', () => {
+  assert.deepEqual(rankOf({ currentTier: { id: 'free-tier' }, paidTier: { id: 'g1-ultra-lite-tier' } }), {
+    rank: 3,
+    tier: 'free-tier',
+    paid: 'g1-ultra-lite-tier',
+  })
+  assert.equal(rankOf({ currentTier: { id: 'free-tier' }, paidTier: { id: 'g1-pro-tier' } }).rank, 2)
+  assert.equal(rankOf({ currentTier: { id: 'g1-ultra-lite-tier' } }).rank, 3)
+  assert.equal(rankOf({}).rank, 0)
+})
+
+check('account: the status line names the plan, not the internal tier id', () => {
+  // `free-tier` is the *effective* tier even on a paying account, so showing it
+  // verbatim reads as "you are on something worse than you paid for".
+  assert.equal(planLabel({ tier: 'free-tier', paid: 'g1-ultra-lite-tier' }), 'Google AI Ultra')
+  assert.equal(planLabel({ tier: 'free-tier', paid: 'g1-pro-tier' }), 'Google AI Pro')
+  assert.equal(planLabel({ tier: 'g1-ultra-tier' }), 'Google AI Ultra')
+  assert.equal(planLabel({ tier: 'standard-tier' }), 'Standard')
+  assert.equal(planLabel({ tier: 'brand-new-tier' }), 'brand-new-tier')
+  assert.equal(planLabel(undefined), '')
+})
+
+check('account: only Google-shaped references are adopted', async () => {
+  const value = (payload) => JSON.stringify(payload)
+  assert.equal(grantOf(value({ access: 'ya29.x', refresh: '1//x' }))?.access_token, 'ya29.x')
+  assert.equal(grantOf(value({ access_token: 'sk-ant-1', refresh_token: 'r' })), undefined)
+  assert.equal(grantOf(value({ access_token: 'x', refresh_token: 'r', scope: 'https://www.googleapis.com/x' }))?.access_token, 'x')
+  assert.equal(grantOf('-----BEGIN PRIVATE KEY-----'), undefined)
+  assert.equal(grantOf('not json'), undefined)
+  assert.equal(grantOf(value({ access_token: 'ya29.x' })), undefined)
+})
+
+check('account: a multi-line quoted reference parses without JSON escaping', () => {
+  const refs = parseRefsBlock(
+    [
+      'version: 1',
+      'refs:',
+      '  GEMINI_ACCOUNT_CD003778: \'{"accessToken":"ya29.a",',
+      '    "refreshToken":"1//b","email":"x@y.z"}\'',
+      '  CODEX_OAUTH_1: \'{"access":"sk-x","refresh":"r"}\'',
+    ].join('\n'),
+  )
+  assert.equal(refs.GEMINI_ACCOUNT_CD003778, '{"accessToken":"ya29.a", "refreshToken":"1//b","email":"x@y.z"}')
+  assert.equal(refs.CODEX_OAUTH_1, '{"access":"sk-x","refresh":"r"}')
 })
 
 check('translation: tool ids are renumbered and paired', () => {

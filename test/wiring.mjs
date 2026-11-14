@@ -141,11 +141,37 @@ await check('the plugin declares its name and injected services', async () => {
     assert.deepEqual(flash.inputModalities, ['text', 'image'])
   })
 
-  await check('the Antigravity model declares every reasoning tier', async () => {
+  await check('the Antigravity model declares the reasoning tiers its upstream serves', async () => {
     const info = await record.adapters.get(ROUTE_GEMINI).resolveModel(ROUTE_GEMINI, 'gemini-3.8-flash')
-    assert.equal(info.context.contextWindow, 1e6)
+    assert.equal(info.context.contextWindow, 1_048_576)
     const efforts = (info.reasoning?.efforts ?? []).map((effort) => effort.id)
-    assert.deepEqual(efforts, ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+    // `gemini-3.8-flash` serves low/medium/high/tiered; `xhigh` is a real tier but
+    // only Gemini 4 Hydrogen serves it, so it must be hidden rather than offered
+    // and then silently downgraded.
+    assert.deepEqual(efforts, ['off', 'minimal', 'low', 'medium', 'high', 'max'])
+  })
+
+  await check('a tier the model does not serve is hidden, not silently downgraded', async () => {
+    const entries = [
+      { id: 'gemini-4-hydrogen', effortOptions: ['low', 'medium', 'high', 'xhigh'], defaultEffort: 'medium' },
+      { id: 'gemini-2.5-pro', contextWindow: 1_000_000, maxTokens: 64_000, supportsImage: true },
+    ]
+    const { thinkingLevelMap } = await import('../lib/antigravity/stream.js')
+    assert.deepEqual(Object.keys(thinkingLevelMap(entries[0].effortOptions)), [
+      'off',
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
+    assert.equal(thinkingLevelMap(entries[0].effortOptions).xhigh, 'xhigh')
+    // A model with no tier ladder at all still answers `off`; every other level
+    // has to be explicitly nulled because pi-ai reads a missing key as supported.
+    const flat = thinkingLevelMap(undefined)
+    assert.equal(flat.off, 'off')
+    assert.equal(flat.high, null)
   })
 
   await check('the Claude model keeps its real context window', async () => {

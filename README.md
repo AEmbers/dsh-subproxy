@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | `sub-gpt` | OpenAI ChatGPT Plus/Pro（Codex 线路） | 9 | OAuth |
 | `sub-claude` | Anthropic Claude Pro/Max | 17 | OAuth |
-| `sub-gemini` | Google Antigravity（Cloud Code Assist） | 随账号目录 | OAuth |
+| `sub-gemini` | Google Antigravity（Cloud Code Assist） | 随账号目录（本人 Ultra 账号：12） | OAuth |
 
 反代的意思很直白：不用 API key、不按 token 计费，用的是你已经付过钱的订阅额度。
 所以 `GET /models` 里这些模型的价格一律记 0 —— 不是漏填，是这套额度本来就不按 token 卖。
@@ -44,7 +44,7 @@ dsh plugin --profile desktop add C:\Sophia\dev-plugin\dsh-subproxy
 任何渲染面**（只有 Electron 的桌面 UI 会用）。命令是所有前端都会渲染的那一个面。
 
 ```text
-/subproxy                  # 三条路由的登录状态
+/subproxy                  # 三条路由的登录状态（含 Antigravity 的模型数与套餐）
 /subproxy login sub-gemini # 开始登录，打印授权链接
 /subproxy code <粘贴>       # 把浏览器跳转后的地址（或 code）贴回来
 /subproxy logout sub-gemini
@@ -61,6 +61,46 @@ dsh plugin --profile desktop add C:\Sophia\dev-plugin\dsh-subproxy
 
 凭据写在 `dsh-subproxy` 这个 credential scope 下，与宿主自带的 `llm-pi-ai` 完全隔离 ——
 两家插件不会互相读到对方解析不了的记录。
+
+### 不用登录也能用上本机已有的 Google 账号
+
+Antigravity IDE / `agy` 把登录态写在 `~/.dsh/.credentials.yaml` 的 **`refs:`** 段
+（不是 `records:` 段）。宿主的 `CredentialProvider` 只枚举 `records:`，所以插件平时
+看不见它们。冷启动时插件会自己扫一遍 `refs:`，逐个拿 `loadCodeAssist` 探档位，按套餐
+从高到低排，**采纳最强那个**写进自己的 record。所以本机已经登录过 Antigravity 的话，
+装完就有模型，不用再登一次。
+
+已有属于本插件自己的凭据时**不会换号**——只探档位用来显示，绝不把路由悄悄切给别的账号。
+
+## 模型为什么会「少」
+
+Antigravity 的模型目录由服务端按账号套餐下发，插件只是如实呈现。同一条线路：
+
+- 免费 / Pro 账号：`gemini-4-carbon|argon|hydrogen` 是 `disabled: true`，上游对它们的
+  所有 tier 都回 `404 Requested entity was not found`。
+- Ultra 账号：这三个全开，另加 `claude-opus-5-5` / `claude-sonnet-5-5` 各 low/medium/high。
+
+因为列出来只会产生一轮注定失败的请求，`disabled` 的模型**不进选择器**，只记一条日志：
+
+```
+[dsh-subproxy] N 个 Antigravity 模型当前账号档位不可用，已隐藏（升级 Google AI 套餐后自动出现）
+```
+
+`/subproxy` 会直接写出真相，例如
+`已登录，12 个可用模型，套餐 Google AI Ultra`。
+`loadCodeAssist` 的 `currentTier.id` 即使是付费号也常常报 `free-tier`，所以插件显示的是
+`paidTier.id` 翻译后的套餐名，不是那个内部 id。
+
+想单独核对（不启动宿主）：
+
+```bash
+node verify-catalog.mjs   # 本机所有 Google 账号的套餐、采纳哪一个、上游每个模型与档位阶梯
+node verify-stream.mjs gemini-4-carbon claude-opus-5-5   # 直接发一次真实请求，验模型 id 通不通
+```
+
+`verify-catalog` 只列目录，`verify-stream` 才是端到端：它走 `buildProviders()` 拿到与宿主
+完全相同的 provider 对象，发一轮真请求，把 SSE 帧解成文本打出来。目录里有的 id 未必服务
+（曾被 404 打回过），这一步能立刻分辨。
 
 ## 路由 id 为什么叫 `sub-*`
 
@@ -80,6 +120,8 @@ Cloud Code Assist 不属于 pi-ai 的十种 `KnownApi` 协议里的任何一种�
 - 工具 id 不合 `^[a-zA-Z0-9_-]{1,64}$` 就重编号，`functionCall` 与 `functionResponse` 必须配同一套。
 - 工具 schema 要清洗：`required: true` 提升到父级、元组 `items` 只留首个、`anyOf` 展平成对象。
 - assistant 的历史轮次里 `thinking` 块只丢内容保留 `thoughtSignature`，挂到 toolCall 上带回去。
+- 档位（tier）有五个：`low`/`medium`/`high`/`xhigh`/`tiered`。`xhigh` 只有 Gemini 4 Hydrogen
+  服务；模型不服务的档位必须显式 `null` 隐藏，否则 harness 会以为支持然后静默降档。
 - 失败阶梯：签名失效 → 丢签名重试；session 溢出 → 换 generation；401 → 刷一次 token；
   429/额度 → 换端点。额度类错误映射成 `QUOTA_EXCEEDED`（不在可重试码表里），
   否则 harness 会白等五轮退避。
@@ -89,8 +131,8 @@ Cloud Code Assist 不属于 pi-ai 的十种 `KnownApi` 协议里的任何一种�
 三套离线测试，不联网、不碰宿主：
 
 ```bash
-node test/antigravity-lane.mjs   # 20 项：schema 清洗、id 重编号、SSE 解帧、失败阶梯
-node test/wiring.mjs             # 20 项：三条路由注册、目录、登录流、命令、dispose
+node test/antigravity-lane.mjs   # 30 项：schema 清洗、目录解析、账号排名、id 重编号、SSE 解帧、失败阶梯
+node test/wiring.mjs             # 21 项：三条路由注册、目录、档位、登录流、命令、dispose
 node test/host-contract.mjs      # 16 项：过真实 PiAiAdapter，验 harness chunk 契约
 ```
 
