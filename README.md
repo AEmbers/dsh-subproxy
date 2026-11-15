@@ -190,12 +190,30 @@ Cloud Code Assist 不属于 pi-ai 的十种 `KnownApi` 协议里的任何一种�
   429/额度 → 换端点。额度类错误映射成 `QUOTA_EXCEEDED`（不在可重试码表里），
   否则 harness 会白等五轮退避。
 
+### 上游的三种伪装
+
+这条线最坑的地方是上游把三种完全不同的结局都包装成「正常结束」，插件必须逐个拆穿，
+否则用户看到的就是「跑完了，什么都没有」：
+
+| 上游表现 | 真实含义 | 插件行为 |
+| --- | --- | --- |
+| HTTP 200，`parts` 里只有一个空 `text`，`finishReason: STOP`，前面若干 `thought` | 只思考不落笔 | 自动重发一次；二次仍空就抛 `只返回了思考`，点明 `finishReason` |
+| HTTP 200，正文是一句 `This request was blocked by Gemini's filters…` | 内容审核吃掉请求 | 不当作答案流出去，抛 `上游内容审核吃掉了这次请求`，附英文原文 |
+| HTTP 429 + `RESOURCE_EXHAUSTED` | 可能真是额度用尽，**也可能只是拒了这次内容** | 去问额度端点：还有额度 → 报「不是额度问题」并列出剩余；确实见底 → 才让用户等 |
+
+第三行是实测出来的：body 一字不差，账号明明有 84% 额度照样回 `Resource has been exhausted`。
+所以判断权只能交给 `lib/antigravity/quota.js` 的额度读数，不能交给 body。
+
+另外一个不属于插件能修的事实：宿主自己的 system prompt 里
+`The browser provides no implicit DOM, route, or screenshot context.` 这一句会单独触发上游审核
+（改了任何一个词就恢复正常）。插件侧唯一能做的是把伪装出来的 429 翻译成人话。
+
 ## 测试
 
 四套离线测试，不联网、不碰宿主：
 
 ```bash
-node test/antigravity-lane.mjs   # 30 项：schema 清洗、目录解析、账号排名、id 重编号、SSE 解帧、失败阶梯
+node test/antigravity-lane.mjs   # 37 项：schema 清洗、目录解析、账号排名、id 重编号、SSE 解帧、失败阶梯、三种伪装
 node test/wiring.mjs             # 28 项：三条路由注册、目录、档位、登录流、命令、账号吸收、watcher、dispose
 node test/host-contract.mjs      # 16 项：过真实 PiAiAdapter，验 harness chunk 契约
 node test/client.mjs             # 26 项：设置页 bundle —— 注册、注入、渲染、三种状态、设备码、粘贴提示

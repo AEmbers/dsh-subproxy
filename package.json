@@ -1,6 +1,6 @@
 {
   "name": "dsh-subproxy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "One DSH plugin that reverse-proxies three subscription upstreams: OpenAI (ChatGPT Plus/Pro), Anthropic (Claude Pro/Max) and Google Antigravity (Gemini Code Assist).",
   "type": "module",
   "main": "./lib/index.js",

@@ -15,6 +15,7 @@ import assert from 'node:assert/strict'
 import {
   ENDPOINTS,
   LOAD_CODE_ASSIST_PATH,
+  QUOTA_PATH,
   STREAM_PATH,
   marshalAlphabetical,
   planLabel,
@@ -487,6 +488,209 @@ const depsFor = (fetchImpl, catalog) => ({
     const last = events.at(-1)
     assert.equal(last.type, 'error')
     assert.match(last.error.errorMessage, /未返回任何内容块/)
+  })
+}
+
+{
+  // The upstream sometimes finishes with nothing but thought parts and
+  // `STOP`. That is a dropped request, not an answer: the same call answers on
+  // a second try, so the lane resends once and keeps the answer.
+  let calls = 0
+  const fetchImpl = async (url) => {
+    if (String(url).includes(LOAD_CODE_ASSIST_PATH)) {
+      return new Response(JSON.stringify({ cloudaicompanionProject: 'p' }), { status: 200 })
+    }
+    calls += 1
+    const frames =
+      calls === 1
+        ? [frame([{ text: 'Let me think about it.', thought: true }], { finishReason: 'STOP' })]
+        : [frame([{ text: 'Here it is.' }], { finishReason: 'STOP' })]
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(sseBody(frames)))
+          controller.close()
+        },
+      }),
+      { status: 200 },
+    )
+  }
+  const events = await drain(
+    streamAntigravity(model, { messages: [{ role: 'user', content: 'hello', timestamp: 1 }] }, { fetch: fetchImpl }, depsFor()),
+  )
+  check('stream: a thought-only STOP is resent once and the answer is kept', () => {
+    assert.equal(calls, 2)
+    assert.equal(events.filter((event) => event.type === 'start').length, 1)
+    const message = events.at(-1).message
+    assert.equal(events.at(-1).type, 'done')
+    assert.equal(message.content.at(-1).text, 'Here it is.')
+    assert.equal(message.content[0].type, 'thinking')
+  })
+}
+
+{
+  // When the resend is empty too, the turn must fail loudly. Reporting success
+  // with no content is what makes an empty answer look like a model decision.
+  const thought = [frame([{ text: 'Thinking only.', thought: true }], { finishReason: 'STOP' })]
+  const events = await drain(
+    streamAntigravity(
+      model,
+      { messages: [{ role: 'user', content: 'hello', timestamp: 1 }] },
+      { fetch: fixtureFetch(thought) },
+      depsFor(),
+    ),
+  )
+  check('stream: a thought-only turn that stays empty surfaces an error naming the cause', () => {
+    const last = events.at(-1)
+    assert.equal(last.type, 'error')
+    assert.match(last.error.errorMessage, /只返回了思考/)
+    assert.match(last.error.errorMessage, /finishReason=STOP/)
+  })
+}
+
+{
+  // A blocked prompt comes back as HTTP 200 and a plain-text apology. It must
+  // never be shown as an answer — the wording is the only thing that marks it.
+  const notice =
+    "This request was blocked by Gemini's filters. They can occasionally trigger by mistake on safe coding, security, or biology-related queries."
+  const events = await drain(
+    streamAntigravity(
+      model,
+      { messages: [{ role: 'user', content: 'hello', timestamp: 1 }] },
+      { fetch: fixtureFetch([frame([{ text: notice }], { finishReason: 'STOP' })]) },
+      depsFor(),
+    ),
+  )
+  check('stream: a filter notice is reported as a rejection, not streamed as an answer', () => {
+    const last = events.at(-1)
+    assert.equal(last.type, 'error')
+    assert.match(last.error.errorMessage, /内容审核/)
+    assert.match(last.error.errorMessage, /blocked by Gemini's filters/)
+    assert.equal(
+      events.some((event) => event.type === 'text_delta'),
+      false,
+    )
+  })
+}
+
+{
+  // A notice split across frames is still caught. The part already shown cannot
+  // be taken back, but the turn must fail rather than finish with the notice as
+  // its answer, and the notice itself must never reach the message.
+  const events = await drain(
+    streamAntigravity(
+      model,
+      { messages: [{ role: 'user', content: 'hello', timestamp: 1 }] },
+      {
+        fetch: fixtureFetch([
+          frame([{ text: 'This request was ' }]),
+          frame([{ text: "blocked by Gemini's filters." }], { finishReason: 'STOP' }),
+        ]),
+      },
+      depsFor(),
+    ),
+  )
+  check('stream: a filter notice split over two frames is still caught', () => {
+    const last = events.at(-1)
+    assert.equal(last.type, 'error')
+    assert.match(last.error.errorMessage, /内容审核/)
+    assert.equal(
+      events.some((event) => event.type === 'done'),
+      false,
+    )
+  })
+}
+
+{
+  // An answer that merely starts with a marker's first letter must still
+  // stream normally — the peek may not delay or merge real text.
+  const events = await drain(
+    streamAntigravity(
+      model,
+      { messages: [{ role: 'user', content: 'hello', timestamp: 1 }] },
+      { fetch: fixtureFetch([frame([{ text: 'Because ' }]), frame([{ text: 'it is true.' }], { finishReason: 'STOP' })]) },
+      depsFor(),
+    ),
+  )
+  check('stream: an answer whose opening only resembles a marker still streams', () => {
+    const message = events.at(-1).message
+    assert.equal(events.at(-1).type, 'done')
+    assert.equal(message.content[0].text, 'Because it is true.')
+  })
+}
+
+{
+  // A 429 is also how the upstream answers a rejected prompt, with the same
+  // `RESOURCE_EXHAUSTED` body a spent account gets. The quota endpoint is the
+  // only honest tie-breaker: budget left means the request was refused.
+  const events = await drain(
+    streamAntigravity(
+      model,
+      { messages: [{ role: 'user', content: 'hello', timestamp: 1 }] },
+      {
+        fetch: async (url) => {
+          const href = String(url)
+          if (href.includes(LOAD_CODE_ASSIST_PATH)) {
+            return new Response(JSON.stringify({ cloudaicompanionProject: 'p' }), { status: 200 })
+          }
+          if (href.includes(QUOTA_PATH)) {
+            return new Response(
+              JSON.stringify({
+                groups: [{ buckets: [{ bucketId: 'gemini-weekly', remainingFraction: 0.84, window: 'weekly' }] }],
+              }),
+              { status: 200 },
+            )
+          }
+          return new Response(
+            JSON.stringify({ error: { code: 429, message: 'Resource has been exhausted (e.g. check quota).', status: 'RESOURCE_EXHAUSTED' } }),
+            { status: 429 },
+          )
+        },
+      },
+      depsFor(),
+    ),
+  )
+  check('stream: a 429 with budget left is reported as a content rejection, with the reading', () => {
+    const last = events.at(-1)
+    assert.equal(last.type, 'error')
+    assert.match(last.error.errorMessage, /HTTP 429/)
+    assert.match(last.error.errorMessage, /不是额度问题/)
+    assert.match(last.error.errorMessage, /gemini-weekly 84%/)
+  })
+}
+
+{
+  // The other half of the same rule: a genuinely spent account must keep its
+  // "wait and retry" advice rather than being blamed on the prompt.
+  const events = await drain(
+    streamAntigravity(
+      model,
+      { messages: [{ role: 'user', content: 'hello', timestamp: 1 }] },
+      {
+        fetch: async (url) => {
+          const href = String(url)
+          if (href.includes(LOAD_CODE_ASSIST_PATH)) {
+            return new Response(JSON.stringify({ cloudaicompanionProject: 'p' }), { status: 200 })
+          }
+          if (href.includes(QUOTA_PATH)) {
+            return new Response(
+              JSON.stringify({ groups: [{ buckets: [{ bucketId: 'gemini-weekly', remainingFraction: 0 }] }] }),
+              { status: 200 },
+            )
+          }
+          return new Response(
+            JSON.stringify({ error: { code: 429, message: 'Resource has been exhausted (e.g. check quota).', status: 'RESOURCE_EXHAUSTED' } }),
+            { status: 429 },
+          )
+        },
+      },
+      depsFor(),
+    ),
+  )
+  check('stream: a 429 with an empty bucket keeps the quota advice', () => {
+    const last = events.at(-1)
+    assert.equal(last.type, 'error')
+    assert.match(last.error.errorMessage, /账号额度或限流/)
   })
 }
 
