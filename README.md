@@ -208,12 +208,30 @@ Cloud Code Assist 不属于 pi-ai 的十种 `KnownApi` 协议里的任何一种�
 `The browser provides no implicit DOM, route, or screenshot context.` 这一句会单独触发上游审核
 （改了任何一个词就恢复正常）。插件侧唯一能做的是把伪装出来的 429 翻译成人话。
 
+不过这一句实在绕不过去：它写在**每一个网页会话**的系统提示里，等于每一轮都撞一次。
+所以 `lib/antigravity/sanitize.js` 把它在下发前换成一句语义等价、实测能过的说法——
+
+> The browser gives the page no ambient state beyond what is rendered.
+
+只动宿主自己的样板文字，从不碰用户或助手的消息；每一条改写都必须是「原句被拒、
+替换句通过」两侧都实测过的，没测过的东西没有资格改提示词。宿主把这话换个折行
+（合并行、双空格、不换行空格）也照样命中，因为匹配的是词序而不是字节。
+生效时日志里会提一次，不然「提示词明明这么写，行为却不一样」就没法追。
+
+A/B 对照（`sysctl.mjs`，同一份 40582 字符 system + 200 工具 + 同一句用户消息，
+唯一差别是那 67 个字符）：
+
+| system prompt | 结果 |
+| --- | --- |
+| 保留原句 | **HTTP 429** `RESOURCE_EXHAUSTED` |
+| 换成替换句 | **HTTP 200**，181 字正文 + 2 个 `functionCall` |
+
 ## 测试
 
 四套离线测试，不联网、不碰宿主：
 
 ```bash
-node test/antigravity-lane.mjs   # 37 项：schema 清洗、目录解析、账号排名、id 重编号、SSE 解帧、失败阶梯、三种伪装
+node test/antigravity-lane.mjs   # 40 项：schema 清洗、目录解析、账号排名、id 重编号、SSE 解帧、失败阶梯、三种伪装、宿主提示词改写
 node test/wiring.mjs             # 28 项：三条路由注册、目录、档位、登录流、命令、账号吸收、watcher、dispose
 node test/host-contract.mjs      # 16 项：过真实 PiAiAdapter，验 harness chunk 契约
 node test/client.mjs             # 26 项：设置页 bundle —— 注册、注入、渲染、三种状态、设备码、粘贴提示

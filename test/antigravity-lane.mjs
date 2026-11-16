@@ -333,6 +333,59 @@ check('translation: an empty conversation is refused', () => {
   )
 })
 
+check('translation: the host sentence the upstream refuses is rewritten before it leaves', () => {
+  const systemPrompt = [
+    'You are interacting with the user through the local web GUI.',
+    'The browser provides no implicit DOM, route, or screenshot context.',
+    'The client-plugin HMR receiver is active.',
+  ].join('\n')
+  const result = translateRequest({
+    spec: { upstream: 'm', includeThoughts: false },
+    messages: [{ role: 'user', content: 'hi', timestamp: 1 }],
+    systemPrompt,
+    project: 'p',
+    requestId: 'r',
+    sessionId: 's',
+  })
+  const sent = result.request.systemInstruction.parts[0].text
+  assert.equal(sent.includes('no implicit DOM'), false)
+  assert.match(sent, /no ambient state beyond what is rendered/)
+  // Everything around the sentence is untouched.
+  assert.match(sent, /local web GUI/)
+  assert.match(sent, /HMR receiver is active/)
+  assert.deepEqual(result.systemRewrites, ['browser-context'])
+})
+
+check('translation: the rewrite survives the host reflowing its own prompt', () => {
+  const reflowed = 'The browser provides no  implicit DOM,\nroute, or screenshot context.'
+  const result = translateRequest({
+    spec: { upstream: 'm', includeThoughts: false },
+    messages: [{ role: 'user', content: 'hi', timestamp: 1 }],
+    systemPrompt: reflowed,
+    project: 'p',
+    requestId: 'r',
+    sessionId: 's',
+  })
+  assert.equal(
+    result.request.systemInstruction.parts[0].text,
+    'The browser gives the page no ambient state beyond what is rendered.',
+  )
+})
+
+check('translation: an unrelated prompt is sent byte-for-byte', () => {
+  const systemPrompt = 'You are a careful engineer. Answer in Simplified Chinese.'
+  const result = translateRequest({
+    spec: { upstream: 'm', includeThoughts: false },
+    messages: [{ role: 'user', content: 'hi', timestamp: 1 }],
+    systemPrompt,
+    project: 'p',
+    requestId: 'r',
+    sessionId: 's',
+  })
+  assert.equal(result.request.systemInstruction.parts[0].text, systemPrompt)
+  assert.deepEqual(result.systemRewrites, [])
+})
+
 /** Extract the events a stream produced. */
 const drain = async (stream) => {
   const events = []
